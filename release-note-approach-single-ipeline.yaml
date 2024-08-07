@@ -1,0 +1,126 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+jobs:
+- job: CheckCommitMessage
+  steps:
+  - checkout: self
+
+  - powershell: |
+      # Fetch the latest commit message
+      $latestCommitMessage = git log -1 --pretty=%B
+      
+      # Check if the commit message contains the word "breakout"
+      if ($latestCommitMessage -match "breakout") {
+        Write-Host "##vso[task.setvariable variable=runGenerateReleaseNotes]true"
+      } else {
+        Write-Host "##vso[task.setvariable variable=runGenerateReleaseNotes]false"
+      }
+    displayName: 'Check Latest Commit Message'
+
+- job: GenerateReleaseNotes
+  dependsOn: CheckCommitMessage
+  condition: eq(variables['runGenerateReleaseNotes'], 'true')
+  steps:
+  - checkout: self
+
+  - powershell: |
+      # Fetch all tags and sort them
+      $tags = git tag --sort=-v:refname
+
+      # Get the latest tag
+      $endTag = $tags[0]
+
+      # Get the latest major version
+      $latestMajorVersion = [int]($endTag -split '\.')[0]
+
+      # Initialize startTag as null
+      $startTag = $null
+
+      # Find the previous major version tag
+      foreach ($tag in $tags) {
+          $majorVersion = [int]($tag -split '\.')[0]
+          if ($majorVersion -lt $latestMajorVersion) {
+              $startTag = $tag
+              break
+          }
+      }
+
+      # If no specific previous major version tag is found, throw an error
+      if ($null -eq $startTag) {
+          Write-Error "No previous major version tag found."
+          exit 1
+      }
+
+      Write-Output "Latest tag: $endTag"
+      Write-Output "Previous major version tag: $startTag"
+
+      # Fetch commits between the two tags
+      $commits = git log $startTag..$endTag --pretty=format:"%H"
+
+      # Azure DevOps organization and project
+      $organization = "your_org"
+      $project = "your_project"
+      $pat = "$(System.AccessToken)"
+
+      # Base64 encode the PAT
+      $headers = @{
+          Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$($pat)"))
+      }
+
+      # Initialize arrays to store work items and pull requests
+      $workItems = @()
+      $pullRequests = @()
+
+      foreach ($commit in $commits) {
+          # Fetch associated work items
+          $wiUrl = "https://dev.azure.com/$organization/$project/_apis/wit/workitems?ids=$(git log -1 --pretty=format:%H $commit)&api-version=6.0"
+          $workItems += (Invoke-RestMethod -Uri $wiUrl -Headers $headers).value
+
+          # Fetch associated pull requests
+          $prUrl = "https://dev.azure.com/$organization/$project/_apis/git/repositories/$project/commits/$commit/pullRequests?api-version=6.0"
+          $pullRequests += (Invoke-RestMethod -Uri $prUrl -Headers $headers).value
+      }
+
+      # Output results
+      $workItems | Format-Table
+      $pullRequests | Format-Table
+
+      # Generate release notes
+      $releaseNotes = "# Release Notes from $startTag to $endTag`n"
+      $releaseNotes += "## Work Items`n"
+      foreach ($wi in $workItems) {
+          $releaseNotes += "- [$($wi.id)] $($wi.fields.'System.Title')`n"
+      }
+      $releaseNotes += "## Pull Requests`n"
+      foreach ($pr in $pullRequests) {
+          $releaseNotes += "- [$($pr.pullRequestId)] $($pr.title)`n"
+      }
+
+      # Save release notes to file
+      $releaseNotes | Out-File "$(Build.ArtifactStagingDirectory)/releasenotes.md"
+    displayName: 'Generate Release Notes'
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+      ArtifactName: 'releaseNotes'
+    displayName: 'Publish Release Notes'
+
+  - task: WikiUpdaterTask@2
+    inputs:
+      repo: 'https://dev.azure.com/your_org/your_project/_git/ExampleWiki'
+      branch: 'main'
+      filename: 'Root-page/MyProduct-Versions.md'
+      replaceFile: false
+      dataIsFile: true
+      sourceFile: '$(Build.ArtifactStagingDirectory)/releasenotes.md'
+      message: 'Automatic commit from pipeline'
+      gitname: 'pipeline'
+      gitemail: 'pipeline@example.com'
+      useAgentToken: true
+      localpath: '$(System.DefaultWorkingDirectory)\repo'
+    displayName: 'Update Wiki with Release Notes'
